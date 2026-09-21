@@ -46,15 +46,34 @@ finally:
     camera.release()
 ```
 
-`get_frame()` zwraca klatkę OpenCV w formacie BGR jako `numpy.ndarray` albo `None`, gdy odczyt się nie powiedzie. `release()` trzeba wywołać przy każdym zakończeniu pracy, również po błędzie.
+`get_frame()` zwraca klatkę OpenCV jako `numpy.ndarray` albo `None`, gdy odczyt się nie powiedzie. Domyślnie (`CROP_BORDER=True`) zwracany obraz jest:
 
-Kamera jest konfigurowana domyślnie jako:
+- przycięty z ramki grabbera według `roi_crop=(16, 226, 9, 312)`,
+- przeskalowany do `256 x 192`,
+- nadal w formacie BGR, jeśli wejściowa kamera zwróciła obraz trójkanałowy.
+
+Jeśli program nadrzędny potrzebuje surowej klatki grabbera, należy jawnie wywołać `camera.get_frame(CROP_BORDER=False)`. Wtedy oczekiwana rozdzielczość to `320 x 240`, o ile urządzenie zaakceptuje tę konfigurację.
+
+`release()` trzeba wywołać przy każdym zakończeniu pracy, również po błędzie. Obecna klasa nie zgłasza w konstruktorze, że urządzenie nie otworzyło się poprawnie, dlatego program nadrzędny powinien sprawdzić dostęp do kamery przez pierwszy odczyt i traktować `None` jako błąd krytyczny.
+
+Kamera próbuje skonfigurować urządzenie jako:
 
 - urządzenie: `/dev/video0`,
-- rozdzielczość: `320 x 240`,
+- rozdzielczość wejściowa: `320 x 240`,
 - format V4L2: `YUYV`.
 
-Wartości te należy dopasować do konkretnej kamery termowizyjnej.
+Wartości `width` i `height` dotyczą wejścia kamery, ale aktualny `CameraCalibrator` zakłada crop właściwy dla `320 x 240`. Zmiana rozdzielczości wymaga równoczesnego przeliczenia `roi_crop`; nie należy zmieniać tylko argumentów konstruktora.
+
+### Kalibracja i prostowanie obrazu
+
+`Camera` tworzy `CameraCalibrator`, ale domyślna ścieżka `get_frame()` wykonuje tylko `crop_and_rescale()`. Nie wykonuje `undistort_image()`. Prostowanie całej klatki trzeba wywołać jawnie:
+
+```python
+raw_frame = camera.get_frame(CROP_BORDER=False)
+rectified_frame = camera.calibrator.undistort_image(raw_frame)
+```
+
+`process_grabber_point((x, y))` przyjmuje punkt w układzie surowego grabbera `320x240` i zwraca punkt w wyprostowanym układzie `256x192`. Nie należy używać tej metody dla współrzędnych zwróconych przez domyślne `get_frame()`, ponieważ te współrzędne są już w obrazie po cropie i skalowaniu.
 
 ## API detekcji
 
@@ -66,19 +85,21 @@ for x, y in hotspots:
     print(f"Hotspot: x={x:.1f}, y={y:.1f}")
 ```
 
-## Przykładowa integracja z programem naadrzędnym
+## Przykładowa integracja z programem nadrzędnym
 
 ```python
 from camera import Camera
 from detect_hotspot import detect_hotspots
 
 camera = Camera(dev="/dev/video0", width=320, height=240)
-frame = camera.get_frame()
-detections = []
-hotspots = detect_hotspots(frame)
+try:
+    frame = camera.get_frame()
+    if frame is None:
+        raise RuntimeError("Nie udało się pobrać klatki z kamery")
+    hotspots = detect_hotspots(frame)
+finally:
+    camera.release()
 ```
-
-
 
 Ważne: wynik to lista krotek `(x, y)`, a nie lista słowników. Współrzędne są pikselowe, liczone od lewego górnego rogu obrazu:
 
@@ -133,7 +154,8 @@ def capture_and_detect(camera, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = output_dir / f"{timestamp}_raw.jpg"
-    cv2.imwrite(str(raw_path), frame)
+    if not cv2.imwrite(str(raw_path), frame):
+        raise IOError(f"Nie udało się zapisać obrazu: {raw_path}")
 
     hotspots = detect_hotspots(frame)
     return {
@@ -187,6 +209,21 @@ for x, y in detect_hotspots(frame):
 ## Kolejność integracji
 
 1. Uruchomić kamerę na komputerze pokładowym i sprawdzić odczyt klatek.
-2. Podłączyć trigger z autopilota do `capture_and_detect()`.
-5. Przekazywać dalej wynik wraz z timestampem i identyfikatorem zdjęcia.
-6. Dopiero po walidacji offline włączyć reakcję drona na wykryty hotspot.
+2. Sprawdzić, że pierwszy odczyt nie zwraca `None` i że obraz ma oczekiwany rozmiar `256x192`.
+3. Podłączyć trigger z autopilota do `capture_and_detect()`.
+4. Przekazywać dalej wynik wraz z timestampem i identyfikatorem zdjęcia.
+5. Dopiero po walidacji offline włączyć reakcję drona na wykryty hotspot.
+
+## Review: problemy do rozwiązania przed integracją
+
+Poniższe punkty dotyczą bezpośrednio kontraktu modułów używanych przez program nadrzędny:
+
+1. **Brak jawnej informacji o nieotwartej kamerze.** `Camera.__init__()` nie sprawdza `cap.isOpened()`. Błąd urządzenia może ujawnić się dopiero jako `None` z `get_frame()`. W systemie drona należy dodać kontrolę inicjalizacji albo wymusić kontrolę pierwszej klatki przed startem misji.
+2. **Kontrakt rozdzielczości jest ukryty.** Argumenty `width` i `height` konfigurują grabber, ale `CameraCalibrator` ma stałe granice cropa i wynik `256x192`. Każda inna rozdzielczość może dać błędny obraz lub błędne współrzędne.
+3. **Koszt inicjalizacji kamery jest stały.** Konstruktor odrzuca 100 klatek bez przerwy. To może opóźniać reakcję na trigger i utrudnia testowanie. Rozgrzewkę lepiej kontrolować jawnie w programie nadrzędnym albo parametrizować.
+4. **Domyślna klatka nie jest prostowana optycznie.** `get_frame()` przycina i skaluje obraz, ale nie wywołuje `undistort_image()`. Detektor pracuje więc na obrazie z dystorsją, a `process_grabber_point()` korzysta z innego układu współrzędnych niż wynik detekcji.
+5. **Brak walidacji wejścia detektora.** `detect_hotspots()` zakłada poprawny, niepusty `numpy.ndarray` w skali szarości lub BGR. `None`, obraz BGRA, tablica o złym typie albo pusty obraz mogą zakończyć się wyjątkiem OpenCV zamiast kontrolowanym wynikiem.
+6. **Typ wyniku nie zgadza się z implementacją.** Adnotacja deklaruje `List[Tuple[int, int]]`, a centroid jest najpierw liczony jako float i dopiero rzutowany na `int`. Program nadrzędny powinien traktować wynik jako współrzędne całkowite, ale warto ustalić ten kontrakt formalnie.
+7. **Parametry detekcji są wrażliwe na skalę.** `min_area`, `max_area` i `min_dist_px` dotyczą obrazu po przeskalowaniu do `256x192`. Zmiana rozdzielczości lub cropa wymaga ponownej kalibracji, a `min_dist_px` nie jest odległością w metrach.
+
+Przed lotem należy przetestować osobno: brak kamery, brak klatki, obraz bez hotspotu, jeden hotspot, dwa hotspoty oraz hotspoty znajdujące się bliżej niż `min_dist_px`.
