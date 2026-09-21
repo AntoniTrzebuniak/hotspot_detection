@@ -122,7 +122,6 @@ class Camera:
     ret, frame = self.cap.read()
     if not ret:
       return None
-    return frame
     if CROP_BORDER:
       return self.calibrator.crop_frame(frame)
     return frame
