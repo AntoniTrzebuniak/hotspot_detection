@@ -61,9 +61,9 @@ class CameraCalibrator:
 
   def undistort_image(self, frame: np.ndarray) -> np.ndarray:
     """Przyjmuje surową klatkę 320x240, wycina ramkę, skaluje do 256x192 i prostuje dystorsję."""
-    native_frame = self.crop_and_rescale(frame)
+    #native_frame = self.crop_and_rescale(frame)
     # cv2.remap jest znacznie szybsze niż cv2.undistort na Raspberry Pi 5
-    return cv2.remap(native_frame, self.map1, self.map2, cv2.INTER_LINEAR)
+    return cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
 
   def process_grabber_point(
       self, pt_grabber: Tuple[float, float]
@@ -89,6 +89,16 @@ class CameraCalibrator:
     undistorted = cv2.undistortPoints(src_pt, self.K, self.dist, P=self.new_K)
     return float(undistorted[0, 0, 0]), float(undistorted[0, 0, 1])
 
+  def undistort_point(self, pt: Tuple[float, float]) -> Tuple[float, float]:
+    """Usuwa dystorsję z punktu (x, y) pobranego z klatki po crop and rescale (256x192).
+
+    Nie wykonuje żadnego ponownego przycinania ani skalowania!
+    """
+    src_pt = np.array([[[pt[0], pt[1]]]], dtype=np.float64)
+    undistorted = cv2.undistortPoints(
+        src_pt, self.K, self.dist, P=self.new_K
+    )
+    return float(undistorted[0, 0, 0]), float(undistorted[0, 0, 1])
 
 
 class Camera:
